@@ -12804,6 +12804,126 @@ bool ObTransformUtils::is_full_group_by(ObSelectStmt& stmt, ObSQLMode mode)
   return !stmt.has_order_by() && is_only_full_group_by_on(mode);
 }
 
+int ObTransformUtils::check_need_calc_match_score(ObExecContext *exec_ctx,
+                                                  const ObDMLStmt *stmt,
+                                                  ObRawExpr *match_expr,
+                                                  bool &need_calc,
+                                                  ObIArray<ObExprConstraint> &constraints)
+{
+  int ret = OB_SUCCESS;
+  need_calc = true;
+  if (OB_ISNULL(exec_ctx) || OB_ISNULL(stmt) || OB_ISNULL(match_expr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null", K(ret), K(exec_ctx), K(stmt), K(match_expr));
+  } else if (!stmt->is_select_stmt()) {
+    // the match score may be consumed by other clauses, keep the old behavior
+    need_calc = true;
+  } else {
+    const ObSelectStmt *select_stmt = static_cast<const ObSelectStmt *>(stmt);
+    ObSEArray<ObRawExpr *, 8> other_exprs;
+    ObSEArray<ObRawExpr *, 8> select_exprs;
+    ObSEArray<ObRawExpr *, 8> order_exprs;
+    if (OB_FAIL(select_stmt->get_select_exprs(select_exprs))) {
+      LOG_WARN("failed to get select exprs", K(ret));
+    } else if (OB_FAIL(select_stmt->get_order_exprs(order_exprs))) {
+      LOG_WARN("failed to get order exprs", K(ret));
+    } else if (OB_FAIL(append(other_exprs, select_exprs))) {
+      LOG_WARN("failed to append select exprs", K(ret));
+    } else if (OB_FAIL(append(other_exprs, order_exprs))) {
+      LOG_WARN("failed to append order exprs", K(ret));
+    } else if (OB_FAIL(append(other_exprs, select_stmt->get_having_exprs()))) {
+      LOG_WARN("failed to append having exprs", K(ret));
+    } else if (OB_FAIL(append(other_exprs, select_stmt->get_group_exprs()))) {
+      LOG_WARN("failed to append group exprs", K(ret));
+    } else if (OB_FAIL(append(other_exprs, select_stmt->get_rollup_exprs()))) {
+      LOG_WARN("failed to append rollup exprs", K(ret));
+    } else {
+      const ObIArray<ObWinFunRawExpr *> &win_func_exprs = select_stmt->get_window_func_exprs();
+      for (int64_t i = 0; OB_SUCC(ret) && i < win_func_exprs.count(); ++i) {
+        if (OB_ISNULL(win_func_exprs.at(i))) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("get unexpected null window function expr", K(ret));
+        } else if (OB_FAIL(other_exprs.push_back(static_cast<ObRawExpr *>(win_func_exprs.at(i))))) {
+          LOG_WARN("failed to push back window function expr", K(ret));
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      bool found = false;
+      bool found_in_other = false;
+      bool found_in_filter = false;
+      // the match score must be calculated if the match expression is projected or
+      // consumed by other clauses. Use the type level flag instead of comparing the
+      // expr pointer, because the projected match expr may be another expr node.
+      for (int64_t i = 0; OB_SUCC(ret) && !found_in_other && i < other_exprs.count(); ++i) {
+        if (OB_ISNULL(other_exprs.at(i))) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("get unexpected null expr", K(ret), K(i));
+        } else if (other_exprs.at(i)->has_flag(CNT_MATCH_EXPR)) {
+          found_in_other = true;
+        }
+      }
+      if (OB_SUCC(ret)) {
+        need_calc = found_in_other;
+      }
+      // boolean mode / query expansion / phrase mode may rely on the token weights or on
+      // extra match state, keep the old behavior for them.
+      if (OB_SUCC(ret) && !need_calc && T_FUN_MATCH_AGAINST == match_expr->get_expr_type()) {
+        const ObMatchFunRawExpr *match_fun_expr = static_cast<const ObMatchFunRawExpr *>(match_expr);
+        if (NATURAL_LANGUAGE_MODE != match_fun_expr->get_mode_flag()) {
+          need_calc = true;
+        }
+      }
+      // a topn sort above the scan may push a topn filter into the text retrieval scan,
+      // which is only supported when the relevance is calculated, so keep the old
+      // behavior for ordered queries.
+      if (OB_SUCC(ret) && !need_calc && !order_exprs.empty()) {
+        need_calc = true;
+      }
+      // group by / having / rollup above the scan also pushes a partition sort down to
+      // the scan, keep the old behavior for them too.
+      if (OB_SUCC(ret) && !need_calc
+          && (!select_stmt->get_group_exprs().empty()
+              || !select_stmt->get_having_exprs().empty()
+              || !select_stmt->get_rollup_exprs().empty())) {
+        need_calc = true;
+      }
+      // the match score is not needed if the match expression is only used as a boolean
+      // filter, e.g. `WHERE MATCH(...) AGAINST(...)` or `WHERE MATCH(...) AGAINST(...) > 0`
+      for (int64_t i = 0; OB_SUCC(ret) && !need_calc && i < stmt->get_condition_exprs().count(); ++i) {
+        ObRawExpr *cond = stmt->get_condition_exprs().at(i);
+        bool tmp_need_calc = false;
+        found = false;
+        if (OB_ISNULL(cond)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("get unexpected null condition expr", K(ret));
+        } else if (OB_FAIL(ObRawExprUtils::find_expr(cond, match_expr, found))) {
+          LOG_WARN("failed to find expr", K(ret));
+        } else if (!found) {
+          // do nothing
+        } else {
+          found_in_filter = true;
+          // Only the simple `WHERE MATCH(...) AGAINST(...)` form is safe to skip the
+          // relevance calculation. For any other form (threshold comparison, AND/OR with
+          // other predicates, more than one MATCH in the where clause, ...) the score is
+          // still needed, so keep the old behavior to avoid changing the semantics.
+          const bool only_match_filter = cond->get_expr_type() == T_OP_BOOL
+              && 1 == cond->get_param_count()
+              && cond->get_param_expr(0) == match_expr;
+          if (!only_match_filter || stmt->get_condition_exprs().count() > 1) {
+            need_calc = true;
+          }
+        }
+      }
+      if (OB_SUCC(ret) && !need_calc && !found_in_filter) {
+        // the match expression is not found in the current statement, keep the old behavior
+        need_calc = true;
+      }
+    }
+  }
+  return ret;
+}
+
 int ObTransformUtils::inner_check_need_calc_match_score(ObExecContext *exec_ctx,
                                                         ObRawExpr* expr, 
                                                         ObRawExpr* match_expr, 

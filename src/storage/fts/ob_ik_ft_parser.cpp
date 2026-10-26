@@ -22,6 +22,8 @@
 #include "lib/ob_errno.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/utility/ob_macro_utils.h"
+#include "lib/allocator/page_arena.h"
+#include "lib/lock/ob_mutex.h"
 #include "lib/utility/utility.h"
 #include "data_plane/fts/ob_fts_struct.h"
 #include "data_plane/fts/ob_fts_parser_helper.h"
@@ -40,6 +42,171 @@ namespace oceanbase
 {
 namespace storage
 {
+namespace
+{
+
+// The dictionaries of the ik parser are read only after being loaded from the dict
+// cache, and the parsing result only depends on their content. So a process level
+// shared dictionary cache can be used by all tokenize calls, which avoids loading the
+// dict cache, building the range dict and allocating the cache containers per call.
+class ObIKSharedDictCache
+{
+public:
+  ObIKSharedDictCache()
+      : is_inited_(false),
+        lock_(),
+        alloc_(lib::ObMemAttr("IKSharedDict")),
+        main_container_(nullptr),
+        quan_container_(nullptr),
+        stop_container_(nullptr),
+        main_dict_(nullptr),
+        quan_dict_(nullptr),
+        stop_dict_(nullptr)
+  {
+  }
+  ~ObIKSharedDictCache() {}
+
+public:
+  int get_dicts(ObFTDictHub *hub,
+                ObIFTDict *&main_dict,
+                ObIFTDict *&quan_dict,
+                ObIFTDict *&stop_dict);
+
+private:
+  int build_dict(ObFTDictHub *hub,
+                 const ObFTDictDesc &desc,
+                 ObFTCacheRangeContainer *&container,
+                 ObIFTDict *&dict);
+  void free_dict(ObFTCacheRangeContainer *&container, ObIFTDict *&dict);
+
+private:
+  bool is_inited_;
+  lib::ObMutex lock_;
+  ObArenaAllocator alloc_;
+  ObFTCacheRangeContainer *main_container_;
+  ObFTCacheRangeContainer *quan_container_;
+  ObFTCacheRangeContainer *stop_container_;
+  ObIFTDict *main_dict_;
+  ObIFTDict *quan_dict_;
+  ObIFTDict *stop_dict_;
+
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObIKSharedDictCache);
+};
+
+int ObIKSharedDictCache::build_dict(ObFTDictHub *hub,
+                                    const ObFTDictDesc &desc,
+                                    ObFTCacheRangeContainer *&container,
+                                    ObIFTDict *&dict)
+{
+  int ret = OB_SUCCESS;
+  ObFTCacheRangeContainer *tmp_container = nullptr;
+  ObIFTDict *tmp_dict = nullptr;
+  if (OB_ISNULL(hub)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null dict hub", K(ret));
+  } else if (OB_ISNULL(tmp_container = OB_NEWx(ObFTCacheRangeContainer, &alloc_, alloc_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate fts cache range container", K(ret));
+  } else if (OB_FAIL(hub->load_cache(desc, *tmp_container))) {
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      ret = OB_SUCCESS;
+      if (OB_FAIL(hub->build_cache(desc, *tmp_container))) {
+        LOG_WARN("failed to build fts dict cache", K(ret));
+      }
+    } else {
+      LOG_WARN("failed to load fts dict cache", K(ret));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_ISNULL(tmp_dict = OB_NEWx(ObFTRangeDict, &alloc_, alloc_, tmp_container, desc))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate fts range dict", K(ret));
+    } else if (OB_FAIL(tmp_dict->init())) {
+      LOG_WARN("failed to init fts range dict", K(ret));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    container = tmp_container;
+    dict = tmp_dict;
+  } else {
+    free_dict(tmp_container, tmp_dict);
+  }
+  return ret;
+}
+
+void ObIKSharedDictCache::free_dict(ObFTCacheRangeContainer *&container, ObIFTDict *&dict)
+{
+  if (!OB_ISNULL(dict)) {
+    dict->~ObIFTDict();
+    alloc_.free(dict);
+    dict = nullptr;
+  }
+  if (!OB_ISNULL(container)) {
+    container->~ObFTCacheRangeContainer();
+    alloc_.free(container);
+    container = nullptr;
+  }
+}
+
+int ObIKSharedDictCache::get_dicts(ObFTDictHub *hub,
+                                   ObIFTDict *&main_dict,
+                                   ObIFTDict *&quan_dict,
+                                   ObIFTDict *&stop_dict)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(hub)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null dict hub", K(ret));
+  } else if (is_inited_) {
+    main_dict = main_dict_;
+    quan_dict = quan_dict_;
+    stop_dict = stop_dict_;
+  } else {
+    lib::ObMutexGuard guard(lock_);
+    if (is_inited_) {
+      main_dict = main_dict_;
+      quan_dict = quan_dict_;
+      stop_dict = stop_dict_;
+    } else {
+      ObFTDictDesc main_dict_desc("main_dict",
+                                  ObFTDictType::DICT_IK_MAIN,
+                                  ObCharsetType::CHARSET_UTF8MB4,
+                                  ObCollationType::CS_TYPE_UTF8MB4_BIN);
+      ObFTDictDesc quan_dict_desc("quan_dict",
+                                  ObFTDictType::DICT_IK_QUAN,
+                                  ObCharsetType::CHARSET_UTF8MB4,
+                                  ObCollationType::CS_TYPE_UTF8MB4_BIN);
+      ObFTDictDesc stopword_dict_desc("stopword",
+                                      ObFTDictType::DICT_IK_STOP,
+                                      ObCharsetType::CHARSET_UTF8MB4,
+                                      ObCollationType::CS_TYPE_UTF8MB4_BIN);
+      if (OB_FAIL(build_dict(hub, main_dict_desc, main_container_, main_dict_))) {
+      } else if (OB_FAIL(build_dict(hub, quan_dict_desc, quan_container_, quan_dict_))) {
+        free_dict(main_container_, main_dict_);
+      } else if (OB_FAIL(build_dict(hub, stopword_dict_desc, stop_container_, stop_dict_))) {
+        free_dict(main_container_, main_dict_);
+        free_dict(quan_container_, quan_dict_);
+      }
+      if (OB_SUCC(ret)) {
+        is_inited_ = true;
+        main_dict = main_dict_;
+        quan_dict = quan_dict_;
+        stop_dict = stop_dict_;
+      }
+    }
+  }
+  return ret;
+}
+
+ObIKSharedDictCache &get_ik_shared_dict_cache()
+{
+  static ObIKSharedDictCache cache;
+  return cache;
+}
+
+} // anonymous namespace
+
 int ObIKFTParser::init(const ObFTParserParam &param)
 {
   int ret = OB_SUCCESS;
@@ -255,18 +422,24 @@ int ObIKFTParser::init_dict(const ObFTParserParam &param)
 
   if (should_read_newest_table()) {
     // clear dict cache, always false now
-  } else {
     if (OB_FAIL(init_single_dict(main_dict_desc, cache_main_))) {
     } else if (OB_FAIL(init_single_dict(quan_dict_desc, cache_quan_))) {
     } else if (OB_FAIL(init_single_dict(stopword_dict_desc, cache_stop_))) {
     }
-  }
 
-  if (OB_FAIL(ret)) {
-    // already logged.
-  } else if (OB_FAIL(build_dict_from_cache(main_dict_desc, cache_main_, dict_main_))) {
-  } else if (OB_FAIL(build_dict_from_cache(quan_dict_desc, cache_quan_, dict_quan_))) {
-  } else if (OB_FAIL(build_dict_from_cache(stopword_dict_desc, cache_stop_, dict_stop_))) {
+    if (OB_FAIL(ret)) {
+      // already logged.
+    } else if (OB_FAIL(build_dict_from_cache(main_dict_desc, cache_main_, dict_main_))) {
+    } else if (OB_FAIL(build_dict_from_cache(quan_dict_desc, cache_quan_, dict_quan_))) {
+    } else if (OB_FAIL(build_dict_from_cache(stopword_dict_desc, cache_stop_, dict_stop_))) {
+    }
+  } else if (OB_FAIL(get_ik_shared_dict_cache().get_dicts(hub_,
+                                                           dict_main_,
+                                                           dict_quan_,
+                                                           dict_stop_))) {
+    LOG_WARN("failed to get shared ik dicts", K(ret));
+  } else {
+    is_dict_shared_ = true;
   }
 
   return ret;
@@ -366,18 +539,25 @@ void ObIKFTParser::reset()
   cache_quan_.reset();
   cache_stop_.reset();
 
-  if (!OB_ISNULL(dict_main_)) {
-    dict_main_->~ObIFTDict();
-    allocator_.free(dict_main_);
+  // the shared dicts are owned by the process level dict cache, never free them here
+  if (!is_dict_shared_) {
+    if (!OB_ISNULL(dict_main_)) {
+      dict_main_->~ObIFTDict();
+      allocator_.free(dict_main_);
+    }
+    if (!OB_ISNULL(dict_quan_)) {
+      dict_quan_->~ObIFTDict();
+      allocator_.free(dict_quan_);
+    }
+    if (!OB_ISNULL(dict_stop_)) {
+      dict_stop_->~ObIFTDict();
+      allocator_.free(dict_stop_);
+    }
   }
-  if (!OB_ISNULL(dict_quan_)) {
-    dict_quan_->~ObIFTDict();
-    allocator_.free(dict_quan_);
-  }
-  if (!OB_ISNULL(dict_stop_)) {
-    dict_stop_->~ObIFTDict();
-    allocator_.free(dict_stop_);
-  }
+  dict_main_ = nullptr;
+  dict_quan_ = nullptr;
+  dict_stop_ = nullptr;
+  is_dict_shared_ = false;
 
   is_inited_ = false;
 }

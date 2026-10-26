@@ -1496,8 +1496,12 @@ int ObDASIterUtils::create_text_retrieval_sub_tree(
     if (ir_scan_ctdef->has_pushdown_topk() && !has_duplicate_boolean_tokens) {
       merge_iter_param.topk_mode_ = 1;
       merge_iter_param.daat_mode_ = 1;
-    } else if (merge_iter_param.query_tokens_.count() > OB_MAX_TEXT_RETRIEVAL_TOKEN_CNT
-        || (!is_func_lookup && !ir_scan_ctdef->need_proj_relevance_score())) {
+    } else if (merge_iter_param.query_tokens_.count() > OB_MAX_TEXT_RETRIEVAL_TOKEN_CNT) {
+      // NOTE: do not fall back to TAAT just because the relevance score is not projected.
+      // The TAAT iterator derives its partition count from the bm25 parameter estimation,
+      // which is skipped when no relevance is needed, and it also outputs the doc ids in
+      // hash partition order. Keep using DAAT so that the result set (and the doc id order
+      // of LIMIT queries) stays the same as before.
       if (BOOLEAN_MODE == ir_scan_ctdef->mode_flag_) {
         ret = OB_NOT_SUPPORTED;
         LOG_USER_ERROR(OB_NOT_SUPPORTED, "Boolean mode with more than 256 tokens is");

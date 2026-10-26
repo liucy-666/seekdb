@@ -46,7 +46,8 @@ public:
         cache_stop_(allocator),
         dict_main_(nullptr),
         dict_quan_(nullptr),
-        dict_stop_(nullptr)
+        dict_stop_(nullptr),
+        is_dict_shared_(false)
   {
   }
 
@@ -106,6 +107,8 @@ private:
   ObIFTDict *dict_main_;
   ObIFTDict *dict_quan_;
   ObIFTDict *dict_stop_;
+  // the shared dicts are owned by the process level dict cache and must not be freed
+  bool is_dict_shared_;
 
   DISABLE_COPY_ASSIGN(ObIKFTParser);
 };
