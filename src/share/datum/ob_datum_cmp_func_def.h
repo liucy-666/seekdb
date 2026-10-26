@@ -376,7 +376,28 @@ struct ObDatumStrCmpImpl
   static int OB_INLINE cmp(const ObDatum &l, const ObDatum &r, int &cmp_ret,
                            const ObCollationType cs, const bool with_end_space)
   {
-    cmp_ret = ObCharset::strcmpsp(cs, l.ptr_, l.len_, r.ptr_, r.len_, with_end_space);
+    const ObCharsetInfo *charset_info = NULL;
+    // Fast path for the collations that are used by the rowkey of the fulltext index
+    // tables (word: utf8mb4_general_ci, doc id: binary). ObCharset::strcmpsp does the
+    // argument validation and the collation lookup on every comparison, which shows up
+    // on the hot path of the index building sort and of the query merge. Skip them when
+    // the datum is well formed and fall back to the original path otherwise.
+    if (OB_LIKELY(CS_TYPE_UTF8MB4_GENERAL_CI == cs)) {
+      charset_info = &ob_charset_utf8mb4_general_ci;
+    } else if (OB_LIKELY(CS_TYPE_BINARY == cs)) {
+      charset_info = &ob_charset_bin;
+    }
+    if (OB_LIKELY(NULL != charset_info)
+        && OB_LIKELY((0 == l.len_ || NULL != l.ptr_) && (0 == r.len_ || NULL != r.ptr_))) {
+      cmp_ret = charset_info->coll->strnncollsp(charset_info,
+                                                reinterpret_cast<const unsigned char *>(l.ptr_),
+                                                l.len_,
+                                                reinterpret_cast<const unsigned char *>(r.ptr_),
+                                                r.len_,
+                                                with_end_space);
+    } else {
+      cmp_ret = ObCharset::strcmpsp(cs, l.ptr_, l.len_, r.ptr_, r.len_, with_end_space);
+    }
     cmp_ret = cmp_ret > 0 ? 1 : (cmp_ret < 0 ? -1 : 0);
     return OB_SUCCESS;
   }
