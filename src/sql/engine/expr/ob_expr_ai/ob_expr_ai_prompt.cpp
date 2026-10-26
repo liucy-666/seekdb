@@ -20,6 +20,7 @@
 #include "ob_ai_func.h"
 #include "lib/utility/utility.h"
 #include "common/json_type/ob_json_common.h"
+#include "sql/engine/expr/ob_expr_json_func_helper.h"
 
 
 using namespace oceanbase::common;
@@ -52,7 +53,10 @@ int ObExprAIPrompt::calc_result_typeN(ObExprResType &type,
   int ret = OB_SUCCESS;
   bool is_null_res = false;
   ObExprResType template_type = types_stack[0];
-  if (!ob_is_string_tc(template_type.get_type())) {
+  // Templates and args accept the whole string family: char/varchar/binary
+  // as well as tinytext/text/mediumtext/longtext (blob is the binary
+  // collation variant of the text types).
+  if (!ob_is_string_type(template_type.get_type())) {
     ret = OB_ERR_INVALID_TYPE_FOR_OP;
   } else {
     types_stack[0].set_calc_type(ObVarcharType);
@@ -60,12 +64,12 @@ int ObExprAIPrompt::calc_result_typeN(ObExprResType &type,
   }
 
   for (int64_t i = 1; i < param_num && OB_SUCC(ret); i++) {
-    if (ob_is_string_tc(types_stack[i].get_type())) {
+    if (ob_is_string_type(types_stack[i].get_type())) {
       types_stack[i].set_calc_type(ObVarcharType);
       types_stack[i].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
     } else if (ob_is_json(types_stack[i].get_type())) {
-      ret = OB_NOT_SUPPORTED;
-      LOG_USER_ERROR(OB_NOT_SUPPORTED, "json type is not supported");
+      // JSON args keep their type and are embedded into the prompt envelope
+      // as JSON values instead of being rejected.
     } else {
       ret = OB_ERR_INVALID_TYPE_FOR_OP;
     }
@@ -113,8 +117,14 @@ int ObExprAIPrompt::eval_ai_prompt(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &
         } else if (OB_FAIL(args_array->append(arg_json_str))) {
         }
       } else if (ob_is_json(arg->datum_meta_.type_)) {
-        ret = OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "json type is not supported");
+        ObIJsonBase *arg_json = NULL;
+        ObCollationType arg_cs_type = arg->obj_meta_.get_collation_type();
+        if (OB_FAIL(ObJsonExprHelper::get_json_val(*datum, ctx.exec_ctx_, arg,
+            &tmp_allocator, arg->datum_meta_.type_, arg_cs_type, arg_json))) {
+        } else if (OB_ISNULL(arg_json)) {
+          ret = OB_ERR_INVALID_TYPE_FOR_OP;
+        } else if (OB_FAIL(args_array->array_append(arg_json))) {
+        }
       } else if (datum->is_null()) {
         ret = OB_ERR_INVALID_TYPE_FOR_OP;
       }

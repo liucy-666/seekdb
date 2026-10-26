@@ -73,11 +73,11 @@ ObAIFuncClient::~ObAIFuncClient()
   }
 }
 
-int ObAIFuncClient::init(common::ObIAllocator &allocator, const common::ObString &url, ObArray<ObString> &headers) 
+int ObAIFuncClient::init(common::ObIAllocator &allocator, const common::ObString &url, ObArray<ObString> &headers)
 {
   int ret = OB_SUCCESS;
   int64_t remain_timeout_us = THIS_WORKER.is_timeout_ts_valid() ? THIS_WORKER.get_timeout_remain() : timeout_sec_ * 1000000;
-  if (OB_ISNULL(url) || headers.empty()) {
+  if (OB_ISNULL(url)) {
     ret = OB_INVALID_ARGUMENT;
   } else {
     allocator_ = &allocator;
@@ -97,6 +97,16 @@ int ObAIFuncClient::init(common::ObIAllocator &allocator, const common::ObString
           ret = OB_ERR_UNEXPECTED;
         } else {
           LOG_DEBUG("ai_function, header:", K(headers.at(i)));
+        }
+      }
+      if (OB_SUCC(ret) && 0 == num_headers && OB_ISNULL(header_list_)) {
+        // Key-less providers (e.g. Ollama) send no auth headers; curl would
+        // default POST content-type to form-urlencoded without an explicit one.
+        ObString default_header("Content-Type: application/json");
+        ObString header_c_str;
+        if (OB_FAIL(ob_write_string(*allocator_, default_header, header_c_str, true))) {
+        } else if (OB_ISNULL(header_list_ = curl_slist_append(header_list_, header_c_str.ptr()))) {
+          ret = OB_ERR_UNEXPECTED;
         }
       }
     }
